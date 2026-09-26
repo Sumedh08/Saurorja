@@ -7,6 +7,7 @@ import { InvitationAcceptance } from "@/components/invitation-acceptance";
 import { OrganizationScreen } from "@/components/organization-screen";
 
 const { replace } = vi.hoisted(() => ({ replace: vi.fn() }));
+const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ replace }) }));
 vi.mock("next/link", () => ({
@@ -38,6 +39,8 @@ describe("Module 2 browser experience", () => {
   afterEach(() => {
     cleanup();
     document.querySelectorAll("body > form").forEach((form) => form.remove());
+    if (originalClipboard) Object.defineProperty(navigator, "clipboard", originalClipboard);
+    else Reflect.deleteProperty(navigator, "clipboard");
     vi.restoreAllMocks();
   });
 
@@ -211,6 +214,45 @@ describe("Module 2 browser experience", () => {
     expect(await screen.findByLabelText("Role for Owner")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Invitations" })).toBeInTheDocument();
     expect(within(screen.getByLabelText("Role")).queryByRole("option", { name: "OWNER" })).not.toBeInTheDocument();
+  });
+
+  it("creates an invitation and copies its one-time link", async () => {
+    const invitationUrl = "http://localhost/invitations/accept#t=one-time-token";
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), apiOrigin).pathname;
+      if (path === "/api/v1/organizations/org-1/invitations" && init?.method === "POST") {
+        return Response.json({ invitation_url: invitationUrl });
+      }
+      return Response.json(organizationResponse(path, "OWNER"));
+    });
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("fetch", fetchMock);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    renderWithQueries(<OrganizationScreen organizationId="org-1" />);
+
+    expect(await screen.findByRole("heading", { name: "Invitations" })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Email address"), {
+      target: { value: "new-member@example.com" },
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Create invitation" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Create invitation" }));
+    expect(await screen.findByLabelText("One-time invitation link")).toHaveValue(invitationUrl);
+
+    const createCall = fetchMock.mock.calls.find(
+      ([input, init]) =>
+        new URL(String(input), apiOrigin).pathname === "/api/v1/organizations/org-1/invitations" &&
+        init?.method === "POST",
+    );
+    expect(new Headers(createCall?.[1]?.headers).get("X-CSRF-Token")).toBe("test-csrf-token");
+    expect(JSON.parse(String(createCall?.[1]?.body))).toEqual({
+      email: "new-member@example.com",
+      role: "VIEWER",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Copy link" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(invitationUrl));
   });
 });
 

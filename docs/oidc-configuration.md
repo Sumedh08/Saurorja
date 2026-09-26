@@ -38,6 +38,8 @@ After changing OIDC configuration, recreate the API so the static configuration 
 docker compose up -d --build api web
 ```
 
+Run `make oidc-check` to verify issuer discovery, exact issuer matching, authorization-code support, PKCE S256 metadata, and the configured client-authentication method from the API container. This preflight does not authenticate a user; the real browser login/logout flow must still be exercised with an IdP account.
+
 If OIDC settings are absent in development, the application still serves liveness and the anonymous shell, but login returns a safe `authentication_unavailable` response. Partial configuration and insecure production URLs fail startup validation. There is no development identity bypass.
 
 ## Browser and logout behavior

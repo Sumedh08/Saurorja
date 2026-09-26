@@ -10,8 +10,83 @@ from authlib.integrations.starlette_client import OAuth
 from joserfc import jwk, jwt
 from joserfc.errors import JoseError
 
+from app.core.config import Settings
+from app.modules.identity.oidc import (
+    OIDCAdapter,
+    OIDCAdapterError,
+    _validate_authorized_party,
+)
+
 ISSUER = "https://issuer.example.com"
 CLIENT_ID = "saurorja-test-client"
+
+
+class MetadataClient:
+    def __init__(self, metadata: dict[str, object]) -> None:
+        self.metadata = metadata
+
+    async def load_server_metadata(self) -> dict[str, object]:
+        return self.metadata
+
+
+class MetadataOAuth:
+    def __init__(self, metadata: dict[str, object]) -> None:
+        self.client = MetadataClient(metadata)
+
+    def create_client(self, name: str) -> MetadataClient:
+        assert name == "saurorja"
+        return self.client
+
+
+def adapter_for_metadata(metadata: dict[str, object]) -> OIDCAdapter:
+    settings = Settings(
+        _env_file=None,
+        app_env="test",
+        oidc_issuer_url=ISSUER,
+        oidc_client_id=CLIENT_ID,
+        oidc_client_secret="test-client-secret",
+        oidc_redirect_uri="https://app.example.com/api/v1/auth/callback",
+        oidc_post_logout_redirect_uri="https://app.example.com/api/v1/auth/logout/callback",
+        public_app_origin="https://app.example.com",
+    )
+    return OIDCAdapter(MetadataOAuth(metadata), settings)
+
+
+def supported_metadata() -> dict[str, object]:
+    return {
+        "issuer": ISSUER,
+        "authorization_endpoint": f"{ISSUER}/authorize",
+        "token_endpoint": f"{ISSUER}/token",
+        "jwks_uri": f"{ISSUER}/jwks",
+        "response_types_supported": ["code"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["client_secret_basic"],
+    }
+
+
+def test_oidc_preflight_accepts_supported_discovery_metadata() -> None:
+    asyncio.run(adapter_for_metadata(supported_metadata()).check_provider())
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"issuer": "https://other.example.com"},
+        {"response_types_supported": ["token"]},
+        {"response_types_supported": None},
+        {"code_challenge_methods_supported": ["plain"]},
+        {"code_challenge_methods_supported": None},
+        {"token_endpoint_auth_methods_supported": ["none"]},
+        {"jwks_uri": None},
+    ],
+)
+def test_oidc_preflight_rejects_incompatible_discovery_metadata(
+    changes: dict[str, object],
+) -> None:
+    metadata = supported_metadata()
+    metadata.update(changes)
+    with pytest.raises(OIDCAdapterError):
+        asyncio.run(adapter_for_metadata(metadata).check_provider())
 
 
 def configured_client(public_jwk: Mapping[str, object]) -> Any:
@@ -115,3 +190,27 @@ def test_authlib_rejects_wrong_issuer_audience_and_expired_tokens(
                 claims_options={"iss": {"values": [ISSUER]}},
             )
         )
+
+
+@pytest.mark.parametrize(
+    ("audience", "authorized_party", "valid"),
+    [
+        (CLIENT_ID, None, True),
+        ([CLIENT_ID], None, True),
+        ([CLIENT_ID, "other-client"], CLIENT_ID, True),
+        ([CLIENT_ID, "other-client"], None, False),
+        ([CLIENT_ID, "other-client"], "other-client", False),
+        (CLIENT_ID, "other-client", False),
+    ],
+)
+def test_authorized_party_is_checked_for_multiple_or_mismatched_audiences(
+    audience: str | list[str], authorized_party: str | None, valid: bool
+) -> None:
+    claims: dict[str, object] = {"aud": audience}
+    if authorized_party is not None:
+        claims["azp"] = authorized_party
+    if valid:
+        _validate_authorized_party(claims, CLIENT_ID)
+    else:
+        with pytest.raises(OIDCAdapterError):
+            _validate_authorized_party(claims, CLIENT_ID)

@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import getpass
 import sys
 from datetime import UTC, datetime, timedelta
@@ -10,7 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.db.session import SessionFactory
 from app.modules.identity.models import (
     ApplicationSession,
@@ -18,6 +19,7 @@ from app.modules.identity.models import (
     OIDCTransaction,
     PendingIdentitySession,
 )
+from app.modules.identity.oidc import configured_oidc
 from app.modules.identity.operators import (
     OperatorConflict,
     bootstrap_admin,
@@ -56,6 +58,8 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="group", required=True)
     auth = commands.add_parser("auth", help="trusted operator identity and access workflows")
     auth_commands = auth.add_subparsers(dest="command", required=True)
+
+    auth_commands.add_parser("check-oidc", help="check provider discovery and client-flow support")
 
     bootstrap = auth_commands.add_parser("bootstrap-admin")
     bootstrap.add_argument("--organization-name", required=True)
@@ -159,9 +163,32 @@ def _prune(db: Session, limit: int) -> dict[str, int]:
     return counts
 
 
+def _check_oidc(settings: Settings) -> int:
+    if not settings.oidc_configured:
+        print("OIDC is not configured; set the complete OIDC_* values first.", file=sys.stderr)
+        return 2
+    oidc = configured_oidc(settings)
+    if oidc is None:
+        print("OIDC is not configured; set the complete OIDC_* values first.", file=sys.stderr)
+        return 2
+    try:
+        asyncio.run(oidc.check_provider())
+    except Exception:
+        print(
+            "OIDC discovery or client-flow validation failed; check provider reachability "
+            "and settings.",
+            file=sys.stderr,
+        )
+        return 2
+    print("OIDC discovery and Authorization Code + PKCE metadata checks passed.")
+    return 0
+
+
 def run(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     settings = get_settings()
+    if args.command == "check-oidc":
+        return _check_oidc(settings)
     try:
         with SessionFactory() as db, db.begin():
             if args.command == "bootstrap-admin":

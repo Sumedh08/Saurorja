@@ -39,6 +39,8 @@ Saurorja does not install an identity provider in Compose. Configure a confident
 
 After Compose has completed the migration and the OIDC provider is reachable, run the bootstrap command from an interactive terminal. Obtain the exact issuer and subject from the trusted IdP administration interface; the subject is entered through a hidden prompt, not a command-line argument:
 
+First, run `make oidc-check` to verify discovery and required client-flow metadata. This is a provider preflight, not an end-user login test.
+
 ```shell
 docker compose exec -it api python -m app.cli auth bootstrap-admin \
   --organization-name "Example Operations" \
@@ -58,6 +60,8 @@ make test          # backend pytest suite
 make lint          # Ruff and ESLint
 make format        # Ruff format and safe fixes
 make typecheck     # mypy and TypeScript
+make web-build     # Next.js production build
+make oidc-check    # OIDC discovery and client-flow preflight
 make migrate       # run Alembic in the Compose environment
 make compose-up
 make compose-down

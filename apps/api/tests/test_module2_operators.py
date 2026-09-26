@@ -8,7 +8,7 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import func, select
 
-from app.cli import _confirm, parser
+from app.cli import _check_oidc, _confirm, parser
 from app.core.config import Settings
 from app.db.session import SessionFactory
 from app.modules.identity.models import (
@@ -490,6 +490,16 @@ def test_operator_cli_has_only_purpose_specific_role_recovery() -> None:
     )
     assert args.command == "recover-owner"
     assert not hasattr(parser().parse_args(["auth", "prune"]), "role")
+
+
+def test_operator_cli_exposes_oidc_preflight_without_database_arguments() -> None:
+    args = parser().parse_args(["auth", "check-oidc"])
+    assert args.command == "check-oidc"
+
+
+def test_oidc_preflight_requires_complete_configuration(capsys: pytest.CaptureFixture[str]) -> None:
+    assert _check_oidc(Settings(_env_file=None)) == 2
+    assert "OIDC is not configured" in capsys.readouterr().err
 
 
 def test_noninteractive_cli_uuid_confirmation_accepts_exact_target() -> None:
