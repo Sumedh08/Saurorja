@@ -8,7 +8,9 @@ from threading import Thread
 from typing import Any, cast
 from urllib.parse import parse_qs, urlsplit
 
+import pytest
 from joserfc import jwk, jwt
+from joserfc.errors import JoseError
 
 from app.core.config import Settings
 from app.modules.identity.oidc import OIDCAdapter, configured_oidc
@@ -22,6 +24,9 @@ class ControlledIssuer(ThreadingHTTPServer):
     allow_reuse_address = True
     issuer: str
     signing_key: Any
+    token_signing_key: Any
+    previous_signing_key: Any | None = None
+    jwks_request_count = 0
     pkce_challenge: str | None = None
     nonce: str | None = None
     token_request_authenticated = False
@@ -46,7 +51,13 @@ class IssuerHandler(BaseHTTPRequestHandler):
                 }
             )
         elif self.path == "/oauth/keys":
-            self._json({"keys": [server.signing_key.as_dict(private=False)]})
+            server.jwks_request_count += 1
+            signing_key = (
+                server.previous_signing_key
+                if server.jwks_request_count == 1 and server.previous_signing_key is not None
+                else server.signing_key
+            )
+            self._json({"keys": [signing_key.as_dict(private=False)]})
         else:
             self.send_error(404)
 
@@ -89,7 +100,7 @@ class IssuerHandler(BaseHTTPRequestHandler):
         token = jwt.encode(
             {"alg": "RS256", "kid": "controlled-key"},
             claims,
-            server.signing_key,
+            server.token_signing_key,
             algorithms=["RS256"],
         )
         self._json(
@@ -113,12 +124,31 @@ class IssuerHandler(BaseHTTPRequestHandler):
         return
 
 
-def test_adapter_completes_code_pkce_discovery_jwks_validation_and_logout() -> None:
+@pytest.mark.parametrize(
+    ("rotate_signing_key", "invalid_signature"),
+    [(False, False), (True, False), (False, True)],
+)
+def test_adapter_completes_code_pkce_discovery_jwks_validation_and_logout(
+    rotate_signing_key: bool,
+    invalid_signature: bool,
+) -> None:
     signing_key = jwk.generate_key("RSA", 2048, parameters={"kid": "controlled-key"})
+    previous_signing_key = (
+        jwk.generate_key("RSA", 2048, parameters={"kid": "previous-key"})
+        if rotate_signing_key
+        else None
+    )
+    token_signing_key = (
+        jwk.generate_key("RSA", 2048, parameters={"kid": "controlled-key"})
+        if invalid_signature
+        else signing_key
+    )
     server = ControlledIssuer(("127.0.0.1", 0), IssuerHandler)
     host, port = cast(tuple[str, int], server.server_address)
     server.issuer = f"http://{host}:{port}"
     server.signing_key = signing_key
+    server.token_signing_key = token_signing_key
+    server.previous_signing_key = previous_signing_key
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     settings = Settings(
@@ -148,18 +178,29 @@ def test_adapter_completes_code_pkce_discovery_jwks_validation_and_logout() -> N
         server.pkce_challenge = query["code_challenge"][0]
         server.nonce = nonce
 
-        identity = asyncio.run(
-            adapter.authenticate_callback(
-                code="controlled-code",
-                code_verifier=verifier,
-                expected_nonce_hash=digest_secret(nonce),
+        if invalid_signature:
+            with pytest.raises(JoseError):
+                asyncio.run(
+                    adapter.authenticate_callback(
+                        code="controlled-code",
+                        code_verifier=verifier,
+                        expected_nonce_hash=digest_secret(nonce),
+                    )
+                )
+        else:
+            identity = asyncio.run(
+                adapter.authenticate_callback(
+                    code="controlled-code",
+                    code_verifier=verifier,
+                    expected_nonce_hash=digest_secret(nonce),
+                )
             )
-        )
-        assert identity.subject == "controlled-user-subject"
-        assert identity.email == "controlled@example.test"
-        assert identity.email_verified is True
-        assert identity.display_name == "Controlled Test User"
+            assert identity.subject == "controlled-user-subject"
+            assert identity.email == "controlled@example.test"
+            assert identity.email_verified is True
+            assert identity.display_name == "Controlled Test User"
         assert server.token_request_authenticated
+        assert server.jwks_request_count == (2 if rotate_signing_key else 1)
 
         logout_url = asyncio.run(adapter.logout_url(state="logout-state"))
         assert logout_url is not None
