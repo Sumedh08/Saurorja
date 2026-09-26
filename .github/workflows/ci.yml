@@ -40,7 +40,9 @@ jobs:
           cache: npm
           cache-dependency-path: apps/web/package-lock.json
       - name: Create isolated PostgreSQL test database
-        run: psql "$DATABASE_URL" -c 'CREATE DATABASE saurorja_test'
+        env:
+          PGPASSWORD: saurorja-ci-password
+        run: psql --host=localhost --username=saurorja --dbname=saurorja -c 'CREATE DATABASE saurorja_test'
       - name: Install backend dependencies
         run: uv sync --project apps/api --all-groups --locked
       - name: Backend lint
