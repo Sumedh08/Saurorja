@@ -1,0 +1,194 @@
+name: saurorja
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-saurorja}
+      POSTGRES_USER: ${POSTGRES_USER:-saurorja}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-saurorja-dev-password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    networks: [backend]
+    restart: unless-stopped
+
+  minio:
+    image: saurorja/minio-community:RELEASE.2025-10-15T17-29-55Z
+    build:
+      context: .
+      dockerfile: infra/minio/Dockerfile
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-saurorja}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-saurorja-dev-secret}
+    volumes:
+      - minio_data:/data
+    networks: [backend]
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment: &api_environment
+      APP_NAME: ${APP_NAME:-Saurorja API}
+      APP_ENV: ${APP_ENV:-development}
+      APP_VERSION: ${APP_VERSION:-0.1.0}
+      DEBUG: ${DEBUG:-false}
+      API_PREFIX: ${API_PREFIX:-/api/v1}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-saurorja}:${POSTGRES_PASSWORD:-saurorja-dev-password}@postgres:5432/${POSTGRES_DB:-saurorja}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-saurorja}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-saurorja-dev-secret}
+      MINIO_BUCKET: ${MINIO_BUCKET:-saurorja}
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-saurorja-api}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost"]}
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-}
+      OIDC_POST_LOGOUT_REDIRECT_URI: ${OIDC_POST_LOGOUT_REDIRECT_URI:-}
+      OIDC_SCOPES: ${OIDC_SCOPES:-openid email profile}
+      PUBLIC_APP_ORIGIN: ${PUBLIC_APP_ORIGIN:-http://localhost}
+    command: ["/app/.venv/bin/alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [backend]
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment: *api_environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      minio:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=saurorja-edge
+      - traefik.http.routers.saurorja-api.rule=PathPrefix(`/api`) || Path(`/health`)
+      - traefik.http.routers.saurorja-api.priority=100
+      - traefik.http.routers.saurorja-api.entrypoints=web
+      - traefik.http.services.saurorja-api.loadbalancer.server.port=8000
+    networks: [edge, backend]
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=saurorja-edge
+      - traefik.http.routers.saurorja-web.rule=PathPrefix(`/`)
+      - traefik.http.routers.saurorja-web.priority=1
+      - traefik.http.routers.saurorja-web.entrypoints=web
+      - traefik.http.services.saurorja-web.loadbalancer.server.port=3000
+    networks: [edge]
+    restart: unless-stopped
+
+  traefik:
+    image: traefik:v3.7.13
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=saurorja-edge
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.aliasheadersstrategy=delete
+      - --global.checknewversion=false
+      - --ping=true
+      - --api.dashboard=false
+      # Access logs are disabled so OIDC callback query parameters cannot expose codes/state.
+      - --accesslog=false
+      - --log.level=INFO
+    ports:
+      - "80:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [edge]
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.8.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks: [backend]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.2.0
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-saurorja-grafana-dev}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  minio_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  edge:
+    name: saurorja-edge
+  backend:
+    name: saurorja-backend

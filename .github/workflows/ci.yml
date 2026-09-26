@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: saurorja
+          POSTGRES_USER: saurorja
+          POSTGRES_PASSWORD: saurorja-ci-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U saurorja -d saurorja"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      APP_ENV: test
+      DATABASE_URL: postgresql+psycopg://saurorja:saurorja-ci-password@localhost:5432/saurorja
+      TEST_DATABASE_URL: postgresql+psycopg://saurorja:saurorja-ci-password@localhost:5432/saurorja_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: apps/api/uv.lock
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: Create isolated PostgreSQL test database
+        run: psql "$DATABASE_URL" -c 'CREATE DATABASE saurorja_test'
+      - name: Install backend dependencies
+        run: uv sync --project apps/api --all-groups --locked
+      - name: Backend lint
+        run: uv run --project apps/api --directory apps/api ruff check app tests
+      - name: Backend format check
+        run: uv run --project apps/api --directory apps/api ruff format --check app tests
+      - name: Backend type check
+        run: uv run --project apps/api --directory apps/api mypy app tests
+      - name: Migrations
+        run: uv run --project apps/api --directory apps/api alembic upgrade head
+      - name: Backend tests
+        run: uv run --project apps/api --directory apps/api pytest
+      - name: Install frontend dependencies
+        run: npm ci --prefix apps/web
+      - name: Frontend tests
+        run: npm test --prefix apps/web
+      - name: Frontend lint
+        run: npm run lint --prefix apps/web
+      - name: Frontend type check
+        run: npm run typecheck --prefix apps/web
+      - name: Frontend build
+        run: npm run build --prefix apps/web

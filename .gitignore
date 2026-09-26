@@ -1,0 +1,14 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.next/
+*.tsbuildinfo
+node_modules/
+apps/api/uv.lock.tmp
+coverage.xml
+.coverage
+dist/
