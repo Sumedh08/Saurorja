@@ -296,27 +296,25 @@ def test_user_disable_races_membership_role_change_without_losing_owner() -> Non
     assert "disabled" in results
     assert set(results).issubset({"disabled", "role_changed", "actor_disabled"})
     with SessionFactory() as db:
-        owner = db.get(User, owner_id)
-        successor = db.get(User, successor_id)
+        disabled_owner = db.get(User, owner_id)
+        promoted_successor = db.get(User, successor_id)
         membership = db.get(Membership, successor_membership_id)
-        assert owner is not None and owner.status == "DISABLED"
-        assert successor is not None and successor.status == "ACTIVE"
+        assert disabled_owner is not None and disabled_owner.status == "DISABLED"
+        assert promoted_successor is not None and promoted_successor.status == "ACTIVE"
         assert membership is not None and membership.status == "ACTIVE"
         assert membership.role == "OWNER"
-        assert (
-            db.scalar(
-                select(func.count())
-                .select_from(Membership)
-                .join(User, User.id == Membership.user_id)
-                .where(
-                    Membership.organization_id == organization_id,
-                    Membership.role == "OWNER",
-                    Membership.status == "ACTIVE",
-                    User.status == "ACTIVE",
-                )
+        active_owner_count = db.scalar(
+            select(func.count())
+            .select_from(Membership)
+            .join(User, User.id == Membership.user_id)
+            .where(
+                Membership.organization_id == organization_id,
+                Membership.role == "OWNER",
+                Membership.status == "ACTIVE",
+                User.status == "ACTIVE",
             )
-            >= 1
         )
+        assert active_owner_count is not None and active_owner_count >= 1
         action = db.scalar(
             select(OperatorAction).where(OperatorAction.operation_id == operation_id)
         )
