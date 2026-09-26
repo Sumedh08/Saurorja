@@ -46,15 +46,20 @@ jobs:
       - name: Install backend dependencies
         run: uv sync --project apps/api --all-groups --locked
       - name: Backend lint
-        run: uv run --project apps/api --directory apps/api ruff check app tests
+        working-directory: apps/api
+        run: uv run ruff check app tests
       - name: Backend format check
-        run: uv run --project apps/api --directory apps/api ruff format --check app tests
+        working-directory: apps/api
+        run: uv run ruff format --check app tests
       - name: Backend type check
-        run: uv run --project apps/api --directory apps/api mypy app tests
+        working-directory: apps/api
+        run: uv run mypy app tests
       - name: Migrations
-        run: uv run --project apps/api --directory apps/api alembic upgrade head
+        working-directory: apps/api
+        run: uv run alembic upgrade head
       - name: Backend tests
-        run: uv run --project apps/api --directory apps/api pytest
+        working-directory: apps/api
+        run: uv run pytest
       - name: Install frontend dependencies
         run: npm ci --prefix apps/web
       - name: Frontend tests
