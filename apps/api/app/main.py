@@ -3,7 +3,7 @@ import logging
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from time import perf_counter
 from urllib.parse import parse_qs
 from uuid import uuid4
@@ -33,7 +33,7 @@ from app.common.storage import ObjectStorage
 from app.core.config import Settings, get_settings
 from app.core.errors import http_error_handler, validation_error_handler
 from app.core.logging import configure_logging, request_id_context
-from app.db.session import SessionFactory, engine
+from app.db.session import SessionFactory, database_utc_now, engine
 from app.infrastructure.object_storage import MinioObjectStorage
 from app.modules.identity.dependencies import normal_cookie_name, pending_cookie_name
 from app.modules.identity.models import ApplicationSession, PendingIdentitySession, User
@@ -189,6 +189,7 @@ def create_app(
                     valid = False
                     if supplied:
                         with SessionFactory() as db:
+                            database_now = database_utc_now(db)
                             if normal_value and not pending_value:
                                 normal_session = db.scalar(
                                     select(ApplicationSession).where(
@@ -201,9 +202,9 @@ def create_app(
                                     valid = bool(
                                         user
                                         and user.status == "ACTIVE"
-                                        and normal_session.absolute_expires_at > datetime.now(UTC)
+                                        and normal_session.absolute_expires_at > database_now
                                         and normal_session.last_seen_at
-                                        > datetime.now(UTC) - timedelta(hours=2)
+                                        > database_now - timedelta(hours=2)
                                         and csrf_token_matches(normal_session.csrf_secret, supplied)
                                     )
                             elif pending_value and not normal_value:
@@ -217,7 +218,7 @@ def create_app(
                                     pending_session
                                     and pending_session.consumed_at is None
                                     and pending_session.revoked_at is None
-                                    and pending_session.absolute_expires_at > datetime.now(UTC)
+                                    and pending_session.absolute_expires_at > database_now
                                     and csrf_token_matches(pending_session.csrf_secret, supplied)
                                 )
                     if not valid:

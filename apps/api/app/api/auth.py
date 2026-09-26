@@ -3,15 +3,23 @@ from urllib.parse import parse_qs
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from starlette.responses import RedirectResponse
 
-from app.db.session import database_utc_now, get_db_session
-from app.modules.identity.auth_service import begin_logout, complete_login, start_login
+from app.db.session import get_db_session
+from app.modules.identity.auth_service import (
+    begin_logout,
+    complete_login,
+    consume_logout_transaction,
+    start_login,
+)
 from app.modules.identity.dependencies import BrowserState, get_browser_state, require_session_state
-from app.modules.identity.invitations import accept_attempt, create_attempt, inspect_attempt
-from app.modules.identity.models import InvitationAcceptanceAttempt, OIDCTransaction
+from app.modules.identity.invitations import (
+    accept_attempt,
+    create_attempt,
+    inspect_attempt_preview,
+    pending_invitation_preview,
+)
 from app.modules.identity.schemas import (
     AcceptInvitationResponse,
     AttemptCreated,
@@ -21,7 +29,7 @@ from app.modules.identity.schemas import (
     InvitationTokenRequest,
     PendingView,
 )
-from app.modules.identity.security import digest_secret, encode_secret
+from app.modules.identity.security import encode_secret
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 admission_router = APIRouter(tags=["invitation acceptance"])
@@ -104,20 +112,7 @@ async def logout(
 
 @router.get("/logout/callback", include_in_schema=False)
 def logout_callback(request: Request, db: Session = Depends(get_db_session)) -> Response:
-    state = request.query_params.get("state")
-    tx = None
-    if state:
-        tx = db.scalar(
-            select(OIDCTransaction)
-            .where(
-                OIDCTransaction.kind == "LOGOUT", OIDCTransaction.state_hash == digest_secret(state)
-            )
-            .with_for_update()
-        )
-    now = database_utc_now(db)
-    if tx is not None and tx.consumed_at is None and tx.expires_at > now:
-        tx.consumed_at = now
-        db.commit()
+    consume_logout_transaction(db, request.query_params.get("state"))
     response = RedirectResponse(url="/signed-out", status_code=303)
     response.headers["Cache-Control"] = "no-store"
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -129,35 +124,16 @@ def pending(
     state: BrowserState = Depends(require_session_state),
     db: Session = Depends(get_db_session),
 ) -> PendingView:
-    if state.kind != "pending_identity" or state.session is None:
-        raise HTTPException(
-            status_code=403,
-            detail={"code": "forbidden", "message": "This operation is unavailable"},
-        )
-    attempt = db.scalar(
-        select(InvitationAcceptanceAttempt)
-        .where(
-            InvitationAcceptanceAttempt.pending_identity_session_id == state.session.id,
-            InvitationAcceptanceAttempt.consumed_at.is_(None),
-            InvitationAcceptanceAttempt.expires_at > func.clock_timestamp(),
-        )
-        .order_by(InvitationAcceptanceAttempt.created_at.desc())
-    )
-    if attempt is None:
-        return PendingView(invitation=None)
-    _, invitation = inspect_attempt(db, state, attempt.id)
-    from app.modules.identity.models import Organization
-
-    organization = db.get(Organization, invitation.organization_id)
-    if organization is None:
+    preview = pending_invitation_preview(db, state)
+    if preview is None:
         return PendingView(invitation=None)
     return PendingView(
         invitation={
-            "attempt_id": attempt.id,
-            "organization_name": organization.name,
-            "email": invitation.email,
-            "role": invitation.role,
-            "expires_at": invitation.expires_at.isoformat(),
+            "attempt_id": preview.attempt_id,
+            "organization_name": preview.organization_name,
+            "email": preview.email,
+            "role": preview.role,
+            "expires_at": preview.expires_at.isoformat(),
         }
     )
 
@@ -182,21 +158,13 @@ def get_acceptance_attempt(
     state: BrowserState = Depends(require_session_state),
     db: Session = Depends(get_db_session),
 ) -> InvitationAttemptView:
-    attempt, invitation = inspect_attempt(db, state, attempt_id)
-    from app.modules.identity.models import Organization
-
-    organization = db.get(Organization, invitation.organization_id)
-    if organization is None:
-        raise HTTPException(
-            status_code=404,
-            detail={"code": "invitation_unavailable", "message": "The invitation is unavailable"},
-        )
+    preview = inspect_attempt_preview(db, state, attempt_id)
     return InvitationAttemptView(
-        id=attempt.id,
-        organization={"id": organization.id, "name": organization.name},
-        email=invitation.email,
-        role=invitation.role,
-        expires_at=attempt.expires_at,
+        id=preview.attempt.id,
+        organization={"id": preview.organization.id, "name": preview.organization.name},
+        email=preview.invitation.email,
+        role=preview.invitation.role,
+        expires_at=preview.attempt.expires_at,
     )
 
 

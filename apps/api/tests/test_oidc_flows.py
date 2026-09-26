@@ -21,6 +21,7 @@ from app.modules.identity.models import (
     PendingIdentitySession,
     User,
 )
+from app.modules.identity.oidc import OIDCAdapterError, OIDCIdentity
 from app.modules.identity.security import digest_secret, new_secret
 
 pytestmark = pytest.mark.skipif(
@@ -84,9 +85,52 @@ class FakeOIDC:
     def __init__(self, client: FakeOIDCClient) -> None:
         self.client = client
 
-    def create_client(self, name: str) -> FakeOIDCClient:
-        assert name == "saurorja"
-        return self.client
+    async def authorization_url(
+        self,
+        *,
+        state: str,
+        nonce: str,
+        code_verifier: str,
+    ) -> str:
+        metadata = await self.client.load_server_metadata()
+        if metadata.get("issuer") != ISSUER:
+            raise OIDCAdapterError("provider issuer mismatch")
+        result = await self.client.create_authorization_url(
+            f"{ISSUER}/callback",
+            response_type="code",
+            scope="openid email profile",
+            state=state,
+            nonce=nonce,
+            code_verifier=code_verifier,
+        )
+        return result["url"]
+
+    async def authenticate_callback(
+        self,
+        *,
+        code: str,
+        code_verifier: str,
+        expected_nonce_hash: bytes,
+    ) -> OIDCIdentity:
+        assert code == "code-canary"
+        assert code_verifier
+        nonce = self.client.invalid_nonce or self.client.authorization_arguments["nonce"]
+        if not expected_nonce_hash or digest_secret(nonce) != expected_nonce_hash:
+            raise OIDCAdapterError("nonce mismatch")
+        return OIDCIdentity(
+            subject=self.client.subject,
+            email=self.client.verified_email,
+            email_verified=self.client.verified_email is not None,
+            display_name="OIDC Test User",
+        )
+
+    async def logout_url(
+        self,
+        *,
+        state: str,
+    ) -> str | None:
+        del state
+        return None
 
 
 def build_client(oidc_client: FakeOIDCClient) -> TestClient:

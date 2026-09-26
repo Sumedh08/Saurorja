@@ -4,7 +4,8 @@ from pydantic import ValidationError
 from app.core.config import DEV_DB_PASSWORD, DEV_MINIO_SECRET, Settings
 
 
-def test_settings_defaults_are_development_safe() -> None:
+def test_settings_defaults_are_development_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("APP_ENV", raising=False)
     settings = Settings(_env_file=None)
     assert settings.app_version == "0.1.0"
     assert settings.api_prefix == "/api/v1"

@@ -1,9 +1,10 @@
 import secrets
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import UUID
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -15,10 +16,27 @@ from app.modules.identity.models import (
     Invitation,
     InvitationAcceptanceAttempt,
     Membership,
+    Organization,
     PendingIdentitySession,
     User,
 )
 from app.modules.identity.security import digest_secret, new_secret
+
+
+@dataclass(frozen=True)
+class InvitationAttemptPreview:
+    attempt: InvitationAcceptanceAttempt
+    invitation: Invitation
+    organization: Organization
+
+
+@dataclass(frozen=True)
+class PendingInvitationPreview:
+    attempt_id: UUID
+    organization_name: str
+    email: str
+    role: str
+    expires_at: datetime
 
 
 def _conflict(code: str = "invitation_unavailable", status: int = 409) -> HTTPException:
@@ -92,6 +110,46 @@ def inspect_attempt(
     return attempt, invitation
 
 
+def inspect_attempt_preview(
+    db: Session, state: BrowserState, attempt_id: UUID
+) -> InvitationAttemptPreview:
+    attempt, invitation = inspect_attempt(db, state, attempt_id)
+    organization = db.get(Organization, invitation.organization_id)
+    if organization is None:
+        raise _conflict("invitation_unavailable", 404)
+    return InvitationAttemptPreview(attempt, invitation, organization)
+
+
+def pending_invitation_preview(db: Session, state: BrowserState) -> PendingInvitationPreview | None:
+    if state.kind != "pending_identity" or not isinstance(state.session, PendingIdentitySession):
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "forbidden", "message": "This operation is unavailable"},
+        )
+    attempt = db.scalar(
+        select(InvitationAcceptanceAttempt)
+        .where(
+            InvitationAcceptanceAttempt.pending_identity_session_id == state.session.id,
+            InvitationAcceptanceAttempt.consumed_at.is_(None),
+            InvitationAcceptanceAttempt.expires_at > func.clock_timestamp(),
+        )
+        .order_by(InvitationAcceptanceAttempt.created_at.desc())
+    )
+    if attempt is None:
+        return None
+    try:
+        preview = inspect_attempt_preview(db, state, attempt.id)
+    except HTTPException:
+        return None
+    return PendingInvitationPreview(
+        attempt_id=attempt.id,
+        organization_name=preview.organization.name,
+        email=preview.invitation.email,
+        role=preview.invitation.role,
+        expires_at=preview.invitation.expires_at,
+    )
+
+
 def accept_attempt(
     db: Session, state: BrowserState, attempt_id: UUID
 ) -> tuple[UUID, UUID, str, str | None, datetime | None]:
@@ -119,11 +177,7 @@ def accept_attempt(
             raise _conflict("invitation_unavailable", 404)
 
         invitation = db.get(Invitation, attempt_preview.invitation_id)
-        if invitation is None or invitation.status != "PENDING":
-            raise _conflict()
-        if invitation.expires_at <= now:
-            invitation.status = "EXPIRED"
-            db.commit()
+        if invitation is None:
             raise _conflict()
         organization_id = invitation.organization_id
 
@@ -188,6 +242,7 @@ def accept_attempt(
             select(Invitation)
             .where(Invitation.id == attempt_preview.invitation_id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if invitation is None or invitation.status != "PENDING":
             raise _conflict()

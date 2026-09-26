@@ -6,11 +6,16 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 
-from app.core.config import Settings
-from app.db.base import Base
-from app.db.session import engine
-from app.main import create_app
-from app.modules.identity import models as identity_models  # noqa: F401
+_TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
+if _TEST_DATABASE_URL:
+    # The application engine used by tests must point at the isolated test database.
+    os.environ["DATABASE_URL"] = _TEST_DATABASE_URL
+
+from app.core.config import Settings  # noqa: E402
+from app.db.base import Base  # noqa: E402
+from app.db.session import engine  # noqa: E402
+from app.main import create_app  # noqa: E402
+from app.modules.identity import models as identity_models  # noqa: E402,F401
 
 
 class FakeStorage:
@@ -54,13 +59,13 @@ def client(
 
 @pytest.fixture(scope="session", autouse=True)
 def postgres_schema() -> Iterator[None]:
-    url = os.getenv("TEST_DATABASE_URL")
+    url = _TEST_DATABASE_URL
     if not url:
         yield
         return
     if not urlsplit(url).path.rstrip("/").endswith("_test"):
         raise RuntimeError("TEST_DATABASE_URL must point to a database whose name ends in _test")
-    engine = create_engine(url, pool_pre_ping=True)
+    engine = create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 3})
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     yield

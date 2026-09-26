@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from authlib.integrations.starlette_client import OAuth
 from fastapi import HTTPException, Request, Response
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
@@ -29,6 +28,7 @@ from app.modules.identity.models import (
     PendingIdentitySession,
     User,
 )
+from app.modules.identity.oidc import OIDCAdapter, OIDCAdapterError, OIDCIdentity
 from app.modules.identity.security import (
     digest_secret,
     new_secret,
@@ -80,9 +80,9 @@ def transaction_cookie_settings(request: Request) -> dict[str, Any]:
     }
 
 
-def require_oidc(request: Request) -> tuple[Settings, OAuth]:
+def require_oidc(request: Request) -> tuple[Settings, OIDCAdapter]:
     settings: Settings = request.app.state.settings
-    oidc: OAuth | None = request.app.state.oidc
+    oidc: OIDCAdapter | None = request.app.state.oidc
     if oidc is None:
         raise HTTPException(
             status_code=503,
@@ -146,20 +146,13 @@ async def start_login(
     db.add(tx)
     db.commit()
 
-    client = oidc.create_client("saurorja")
     try:
-        metadata = await client.load_server_metadata()
-        if metadata.get("issuer") != settings.oidc_issuer_url:
-            raise OIDCFailure()
-        authorization = await client.create_authorization_url(
-            settings.oidc_redirect_uri,
-            response_type="code",
-            scope=settings.oidc_scopes,
+        authorization_url = await oidc.authorization_url(
             state=state,
             nonce=nonce,
             code_verifier=verifier,
         )
-    except OIDCFailure:
+    except OIDCAdapterError:
         tx.consumed_at = now
         tx.nonce_hash = None
         tx.pkce_verifier = None
@@ -187,7 +180,7 @@ async def start_login(
             },
         ) from None
 
-    response = RedirectResponse(authorization["url"], status_code=303)
+    response = RedirectResponse(authorization_url, status_code=303)
     response.set_cookie(
         transaction_cookie_name(request), browser_binding, **transaction_cookie_settings(request)
     )
@@ -229,35 +222,38 @@ def _consume_login_transaction(
     return snapshot
 
 
+def consume_logout_transaction(db: Session, state: str | None) -> None:
+    if not state:
+        return
+    transaction = db.scalar(
+        select(OIDCTransaction)
+        .where(
+            OIDCTransaction.kind == "LOGOUT",
+            OIDCTransaction.state_hash == digest_secret(state),
+        )
+        .with_for_update()
+    )
+    now = database_utc_now(db)
+    if transaction is not None and transaction.consumed_at is None and transaction.expires_at > now:
+        transaction.consumed_at = now
+        db.commit()
+
+
 def _validated_profile(
-    claims: Any, userinfo: Any | None = None
+    identity: OIDCIdentity,
 ) -> tuple[str, str | None, str | None, bool, str | None]:
-    subject = claims.get("sub")
-    if not isinstance(subject, str) or not subject:
-        raise OIDCFailure()
-    details: dict[str, Any] = dict(claims)
-    if userinfo is not None:
-        info = dict(userinfo)
-        if info.get("sub") != subject:
-            raise OIDCFailure()
-        for key in ("email", "email_verified", "name"):
-            if key not in details and key in info:
-                details[key] = info[key]
-    verified = details.get("email_verified") is True
-    email_value = details.get("email")
+    verified = identity.email_verified
     normalized_email: str | None = None
     email: str | None = None
-    if verified and isinstance(email_value, str):
+    if verified and identity.email:
         try:
-            email, normalized_email = normalize_email(email_value)
+            email, normalized_email = normalize_email(identity.email)
         except ValueError:
             verified = False
-    display_name = details.get("name")
-    if not isinstance(display_name, str):
-        display_name = None
+    display_name = identity.display_name
     if display_name:
         display_name = display_name.strip()[:200] or None
-    return subject, email, normalized_email, verified, display_name
+    return identity.subject, email, normalized_email, verified, display_name
 
 
 def _revoke_browser_sessions(db: Session, request: Request, now: datetime) -> None:
@@ -291,36 +287,15 @@ async def complete_login(request: Request, db: Session) -> Response:
         snapshot = _consume_login_transaction(db, request, query.get("state"))
         if query.get("error") or not query.get("code"):
             raise OIDCFailure()
-        client = oidc.create_client("saurorja")
-        metadata = await client.load_server_metadata()
-        if metadata.get("issuer") != snapshot.expected_issuer:
+        if snapshot.nonce_hash is None or snapshot.pkce_verifier is None:
             raise OIDCFailure()
-        token = await client.fetch_access_token(
-            redirect_uri=settings.oidc_redirect_uri,
+        identity_claims = await oidc.authenticate_callback(
             code=query["code"],
             code_verifier=snapshot.pkce_verifier,
-            grant_type="authorization_code",
+            expected_nonce_hash=snapshot.nonce_hash,
         )
-        if not isinstance(token, dict) or not isinstance(token.get("id_token"), str):
-            raise OIDCFailure()
-        claims = await client.parse_id_token(
-            token,
-            nonce=None,
-            claims_options={"iss": {"values": [settings.oidc_issuer_url]}},
-        )
-        nonce_claim = claims.get("nonce")
-        if (
-            not isinstance(nonce_claim, str)
-            or snapshot.nonce_hash is None
-            or not hmac.compare_digest(snapshot.nonce_hash, digest_secret(nonce_claim))
-        ):
-            raise OIDCFailure()
-        userinfo = None
-        if not claims.get("email") or claims.get("email_verified") is not True:
-            if metadata.get("userinfo_endpoint") and token.get("access_token"):
-                userinfo = await client.userinfo(token=token)
         subject, email, normalized_email, email_verified, display_name = _validated_profile(
-            claims, userinfo
+            identity_claims
         )
         return_to = safe_return_path(snapshot.return_to)
         acceptance_attempt_id = None
@@ -451,11 +426,9 @@ async def begin_logout(request: Request, db: Session, state: BrowserState) -> Re
     response: RedirectResponse
     try:
         settings, oidc = require_oidc(request)
-        client = oidc.create_client("saurorja")
-        metadata = await client.load_server_metadata()
-        logout_endpoint = metadata.get("end_session_endpoint")
-        if logout_endpoint:
-            state_value = new_secret()
+        state_value = new_secret()
+        logout_url = await oidc.logout_url(state=state_value)
+        if logout_url is not None:
             db.add(
                 OIDCTransaction(
                     kind="LOGOUT",
@@ -466,12 +439,7 @@ async def begin_logout(request: Request, db: Session, state: BrowserState) -> Re
                 )
             )
             db.commit()
-            logout = await client.create_logout_url(
-                post_logout_redirect_uri=settings.oidc_post_logout_redirect_uri,
-                state=state_value,
-                client_id=settings.oidc_client_id,
-            )
-            response = RedirectResponse(logout["url"], status_code=303)
+            response = RedirectResponse(logout_url, status_code=303)
         else:
             response = RedirectResponse(url="/signed-out", status_code=303)
     except Exception:
